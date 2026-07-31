@@ -61,11 +61,26 @@ install_xray(){
 gen_config(){
   mkdir -p "$XRAY_DIR"
   local uuid kp priv pub sid
-  uuid="$($XRAY_BIN uuid)"
-  kp="$($XRAY_BIN x25519)"
-  priv="$(echo "$kp" | awk -F': *' '/[Pp]rivate/{print $2}')"
-  pub="$(echo "$kp"  | awk -F': *' '/[Pp]ublic/{print $2}')"
-  sid="$(openssl rand -hex 8)"
+
+  # 幂等: 已有配置则复用原 UUID/密钥/shortId (导入链接保持不变), 除非显式 REGEN=1
+  if [ -f "$CONF" ] && [ "${REGEN:-0}" != "1" ]; then
+    uuid="$(grep -oE '"id"[^,]*' "$CONF" | head -1 | grep -oE '[0-9a-fA-F-]{36}')"
+    priv="$(grep -oE '"privateKey"[^,]*' "$CONF" | head -1 | sed -E 's/.*"privateKey" *: *"([^"]*)".*/\1/')"
+    sid="$(grep -oE '"shortIds"[^]]*' "$CONF" | grep -oE '"[0-9a-fA-F]+"' | head -1 | tr -d '"')"
+  fi
+
+  # 缺任一字段(首装 或 REGEN=1 或 旧配置不完整)则重新生成
+  if [ -z "${uuid:-}" ] || [ -z "${priv:-}" ] || [ -z "${sid:-}" ]; then
+    uuid="$($XRAY_BIN uuid)"
+    kp="$($XRAY_BIN x25519)"
+    priv="$(echo "$kp" | awk -F': *' '/[Pp]rivate/{print $2}')"
+    sid="$(openssl rand -hex 8)"
+    ylw "已生成新的 UUID / REALITY 密钥 / shortId"
+  else
+    ylw "复用现有 UUID / 密钥 / shortId (导入链接不变; 如需重置请加 REGEN=1)"
+  fi
+  # 由私钥推导公钥, 保证 pbk 与 privateKey 始终配对
+  pub="$($XRAY_BIN x25519 -i "$priv" 2>/dev/null | awk -F': *' '/[Pp]ublic/{print $2}')"
 
   cat > "$CONF" <<EOF
 {
@@ -141,6 +156,7 @@ depend() { need net; }
 RC
     chmod +x /etc/init.d/xray
     rc-update add xray default >/dev/null 2>&1 || true
+    # 无论首装还是重装, 都强制重启以加载最新配置
     rc-service xray restart
   else
     cat > /etc/systemd/system/xray.service <<'SD'
@@ -156,7 +172,9 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 SD
     systemctl daemon-reload
-    systemctl enable --now xray >/dev/null 2>&1 || systemctl restart xray
+    systemctl enable xray >/dev/null 2>&1 || true
+    # 无论首装还是重装, 都强制重启以加载最新配置 (enable --now 不会重启已运行的服务)
+    systemctl restart xray
   fi
 }
 
@@ -174,8 +192,22 @@ show_info(){
 do_install(){
   detect_env; install_deps; install_xray; gen_config; setup_service
   sleep 1
+  # 校验服务确实在运行且端口在监听 (确认新配置已加载)
+  local active listening
+  if [ "$INIT" = "openrc" ]; then
+    active="$(rc-service xray status 2>/dev/null | grep -q started && echo yes || echo no)"
+  else
+    active="$(systemctl is-active xray 2>/dev/null)"
+  fi
+  listening="$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -q ":${PORT} " && echo yes || echo no)"
   echo; grn ">>> 部署完成 <<<"
   show_info
+  echo
+  if { [ "$active" = "yes" ] || [ "$active" = "active" ]; } && [ "$listening" = "yes" ]; then
+    grn "服务状态: 运行中 ✔   端口 ${PORT}: 监听中 ✔ (已加载最新配置)"
+  else
+    red "警告: 服务未正常运行 (active=$active, 端口${PORT}监听=$listening), 请检查: xray -test -c ${CONF}"
+  fi
   echo; ylw "提示: NAT 机请确认外网已映射到端口 ${PORT}; 客户端核心需 Xray ${XRAY_VER} 同代及以上"
 }
 
