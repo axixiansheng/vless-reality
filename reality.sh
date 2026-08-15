@@ -10,7 +10,7 @@ set -euo pipefail
 XRAY_VER="${XRAY_VER:-v26.6.27}"        # 与客户端核心保持一致, 避免 REALITY 握手不兼容
 PORT="${PORT:-30810}"                    # 监听端口 (NAT 机请填已映射的外网端口)
 DEST="${DEST:-www.apple.com}"            # REALITY 偷跑目标 (需支持 TLS1.3+H2, 就近大站)
-TAG="${TAG:-HK-REALITY}"                 # 节点备注名
+TAG="${TAG:-}"                           # 节点备注名 (留空则按 IP 位置自动检测, 如 JP-REALITY)
 # ----------------------------------------------------
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -24,6 +24,24 @@ ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 die(){ red "错误: $*"; exit 1; }
 
 [ "$(id -u)" = "0" ] || die "请用 root 运行"
+
+# ---------- IP 位置检测: 自动生成节点名 ----------
+detect_tag(){
+  local cc loc
+  # 依次尝试多个 GeoIP 接口, 任一成功即可
+  cc="$(curl -fsS --max-time 5 https://ipinfo.io/country 2>/dev/null || true)"
+  [ -n "$cc" ] || cc="$(curl -fsS --max-time 5 http://ip-api.com/line/?fields=countryCode 2>/dev/null || true)"
+  [ -n "$cc" ] || cc="$(curl -fsS --max-time 5 https://ipapi.co/country/ 2>/dev/null || true)"
+  cc="$(printf '%s' "$cc" | tr '[:lower:]' '[:upper:]' | tr -dc 'A-Z')"
+  if [ -n "$cc" ]; then
+    echo "${cc}-REALITY"
+  else
+    echo "UNKNOWN-REALITY"
+  fi
+}
+ensure_tag(){
+  [ -n "$TAG" ] || TAG="$(detect_tag)"
+}
 
 # ---------- 环境探测 ----------
 detect_env(){
@@ -190,7 +208,7 @@ show_info(){
 }
 
 do_install(){
-  detect_env; install_deps; install_xray; gen_config; setup_service
+  detect_env; ensure_tag; install_deps; install_xray; gen_config; setup_service
   sleep 1
   # 校验服务确实在运行且端口在监听 (确认新配置已加载)
   local active listening
